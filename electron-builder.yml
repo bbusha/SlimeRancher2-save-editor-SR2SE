@@ -1,0 +1,41 @@
+appId: dev.sr2se.editor
+productName: SR2 Save Editor
+copyright: Fan-made tool. Slime Rancher 2 and its assets are © Monomi Park.
+directories:
+  output: dist
+  buildResources: build
+files:
+  - out/**
+  - package.json
+  - '!**/*.map'
+extraResources:
+  - from: resources/game
+    to: game
+asar: true
+win:
+  icon: build/icon.ico
+  target:
+    - target: portable
+      arch: [x64]
+    - target: nsis
+      arch: [x64]
+  artifactName: ${productName}-${version}-${os}-${arch}.${ext}
+portable:
+  artifactName: ${productName}-${version}-portable.exe
+nsis:
+  oneClick: false
+  allowToChangeInstallationDirectory: true
+  perMachine: false
+  artifactName: ${productName}-${version}-setup.exe
+linux:
+  icon: build/icon.png
+  category: Game
+  synopsis: Save editor for Slime Rancher 2
+  description: Edit money, upgrades, vac pack, refinery and every ranch plot of a Slime Rancher 2 save, with the real game icons and map. Works on SteamOS / Steam Deck.
+  executableName: sr2-save-editor
+  target:
+    - target: AppImage
+      arch: [x64]
+  artifactName: ${productName}-${version}-${arch}.${ext}
+appImage:
+  artifactName: SR2-Save-Editor-${version}-x86_64.AppImage
