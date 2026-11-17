@@ -1,8 +1,9 @@
 /**
  * Slime Rancher 2 save file (.sav) parser / serializer.
  *
- * Format notes (reverse engineered from GameV10 / PlayerV11 / RanchV03 /
- * LandPlotV02 / AmmoDataV02 / ActorDataV04 persisted data sets):
+ * Format notes (reverse engineered from GameV9 / GameV10 / GameV11,
+ * PlayerV9-12 / RanchV02-03 / LandPlotV02 / AmmoDataV01-02 / ActorDataV02-04
+ * persisted data sets):
  *
  *  - Little endian throughout; strings are .NET BinaryWriter strings
  *    (7-bit length prefix + UTF-8).
@@ -11,6 +12,28 @@
  *  - Lists: <i32 count> then elements. The top-level Actors list is
  *    additionally wrapped by a 00 10 marker before the count.
  *  - Nullable<T> / nullable object refs: bool "has value" then the value.
+ *
+ * Header layouts by game version:
+ *
+ *  - GameV9/V10: SRGAME is followed by four standalone index table objects
+ *    (SRITI, SRRGI, SRGAMEICONINDEX, SRGZONEINDEX) and, near the end of the
+ *    file, an SRUCI upgrade-component index object.
+ *  - GameV11 (Slime Rancher 2 v1.3.x, 2026): the standalone index tables were
+ *    replaced by an INDXTBLLKUP v1 object holding a list of
+ *    (key string, INDXTBL v1 object) pairs right after the SRGAME header:
+ *
+ *        INDXTBLLKUP v1 {
+ *          i32 count
+ *          count × { key string, INDXTBL v1 { i32 count, strings } 00 40 }
+ *        } 00 40
+ *
+ *    with keys 'IdentifiableType', 'ResourceGrowerDefinition',
+ *    '[1].GameIconDefinition' and '[1].World.ZoneDefinition'. A second
+ *    INDXTBLLKUP later in the file (after SRGAMESETTINGS) carries the scene
+ *    group and upgrade component tables
+ *    ('[1].SceneManagement.SceneGroup', '[1].Player.Component.UpgradeComponent').
+ *  - PlayerV12 adds no new field before the refinery counts; the tail after
+ *    itemCounts (bool, f64, bool, SRDZR, VWDITMS, …) is preserved raw.
  *
  * Strategy: the editor only needs a handful of regions (index tables at
  * the start, the game summary currencies, the Player object prefix and the
@@ -31,6 +54,8 @@ export interface Currency {
   id: number;
   amount: number;
   everCollected: number;
+  /** SRCRNCY object version as stored in the save (re-emitted on write). */
+  version: number;
 }
 
 /** One vac-pack ammo slot / plot storage slot. -1 id means empty. */
@@ -105,6 +130,8 @@ export interface SaveFile {
   iconIndex: string[];
   zoneIndex: string[];
   componentIndex: string[];
+  /** Scene group index table (GameV11 only; empty otherwise). */
+  sceneGroupIndex: string[];
   gameName: string;
   saveSlotIndex: number;
   displayName: string;
@@ -215,8 +242,8 @@ function readCurrencies(r: BinaryReader): Currency[] {
   if (n < 0 || n > 64) throw new SaveParseError(`unreasonable currency count ${n}`, r.pos - 4);
   const out: Currency[] = [];
   for (let i = 0; i < n; i++) {
-    readObjStart(r, 'SRCRNCY');
-    out.push({ id: r.i32(), amount: r.i32(), everCollected: r.i32() });
+    const h = readObjStart(r, 'SRCRNCY');
+    out.push({ id: r.i32(), amount: r.i32(), everCollected: r.i32(), version: h.version });
     readObjEnd(r);
   }
   return out;
@@ -288,7 +315,7 @@ function writeAmmoList(w: BinaryWriter, list: AmmoSlot[]): void {
 function writeCurrencies(w: BinaryWriter, list: Currency[]): void {
   w.i32(list.length);
   for (const c of list) {
-    writeObjStart(w, 'SRCRNCY', 1);
+    writeObjStart(w, 'SRCRNCY', c.version);
     w.i32(c.id);
     w.i32(c.amount);
     w.i32(c.everCollected);
@@ -299,7 +326,7 @@ function writeCurrencies(w: BinaryWriter, list: Currency[]): void {
 // ---------------------------------------------------------------------------
 // Player
 
-const SUPPORTED_PLAYER_VERSIONS = new Set([9, 10, 11]);
+const SUPPORTED_PLAYER_VERSIONS = new Set([9, 10, 11, 12]);
 
 function readPlayer(r: BinaryReader): PlayerData {
   const h = readObjStart(r);
@@ -540,11 +567,13 @@ function readActors(r: BinaryReader, ranchVersion: number): Actor[] {
 // ---------------------------------------------------------------------------
 // Top level
 
-const SUPPORTED_GAME_VERSIONS = new Set([9, 10]);
+const SUPPORTED_GAME_VERSIONS = new Set([9, 10, 11]);
+/** First game version that stores index tables in an INDXTBLLKUP object. */
+const INDX_LOOKUP_MIN_GAME_VERSION = 11;
 
-function findAnchor(bytes: Uint8Array, name: string, occurrence: number): number {
+function findAnchor(bytes: Uint8Array, name: string, occurrence: number, from = 0): number {
   const needle = new Uint8Array([name.length, ...new TextEncoder().encode(name)]);
-  let at = -1;
+  let at = from - 1;
   for (let i = 0; i < occurrence; i++) {
     at = indexOfBytes(bytes, needle, at + 1);
     if (at < 0) return -1;
@@ -552,19 +581,66 @@ function findAnchor(bytes: Uint8Array, name: string, occurrence: number): number
   return at;
 }
 
+/**
+ * INDXTBLLKUP v1: a list of (key string, INDXTBL v1 object) pairs used as
+ * index tables in GameV11+ saves.
+ */
+function readIndxLookup(r: BinaryReader): Map<string, string[]> {
+  readObjStart(r, 'INDXTBLLKUP');
+  const n = r.i32();
+  if (n < 0 || n > 64) throw new SaveParseError(`unreasonable index table count ${n}`, r.pos - 4);
+  const tables = new Map<string, string[]>();
+  for (let i = 0; i < n; i++) {
+    const key = r.str();
+    readObjStart(r, 'INDXTBL');
+    tables.set(key, readStrList(r));
+    readObjEnd(r);
+  }
+  readObjEnd(r);
+  return tables;
+}
+
+function lookupTable(tables: Map<string, string[]>, fragment: string): string[] {
+  for (const [key, list] of tables) {
+    if (key.includes(fragment)) return list;
+  }
+  return [];
+}
+
+/**
+ * Index tables from the SRGAME header: standalone named objects before
+ * GameV11, entries of an INDXTBLLKUP object from GameV11 on.
+ */
+function readHeaderIndexTables(r: BinaryReader, gameVersion: number): Map<string, string[]> {
+  if (gameVersion >= INDX_LOOKUP_MIN_GAME_VERSION) {
+    return readIndxLookup(r);
+  }
+  const tables = new Map<string, string[]>();
+  tables.set('IdentifiableType', readIndexTable(r, 'SRITI'));
+  tables.set('ResourceGrowerDefinition', readIndexTable(r, 'SRRGI'));
+  tables.set('GameIconDefinition', readIndexTable(r, 'SRGAMEICONINDEX'));
+  tables.set('ZoneDefinition', readIndexTable(r, 'SRGZONEINDEX'));
+  return tables;
+}
+
 export function parseSave(raw: Uint8Array): SaveFile {
   const r = new BinaryReader(raw);
-  const game = readObjStart(r, 'SRGAME');
+  const game = readObjStart(r);
+  // GameV9/V10 name the root object 'SRGAME'; GameV11 leaves it anonymous.
+  if (game.name !== 'SRGAME' && game.name !== '') {
+    throw new SaveParseError(`not a Slime Rancher 2 save (root object '${game.name}')`, 0);
+  }
   if (!SUPPORTED_GAME_VERSIONS.has(game.version)) {
     throw new SaveParseError(
-      `unsupported save format version ${game.version} (this editor supports Slime Rancher 2 save versions 9-10)`,
+      `unsupported save format version ${game.version} (this editor supports Slime Rancher 2 save versions 9-11)`,
       0,
     );
   }
-  const itemIndex = readIndexTable(r, 'SRITI');
-  const growerIndex = readIndexTable(r, 'SRRGI');
-  const iconIndex = readIndexTable(r, 'SRGAMEICONINDEX');
-  const zoneIndex = readIndexTable(r, 'SRGZONEINDEX');
+  const headerTables = readHeaderIndexTables(r, game.version);
+  const itemIndex = headerTables.get('IdentifiableType') ?? [];
+  const growerIndex = headerTables.get('ResourceGrowerDefinition') ?? [];
+  const iconIndex = lookupTable(headerTables, 'GameIconDefinition');
+  const zoneIndex = lookupTable(headerTables, 'ZoneDefinition');
   const gameName = r.str();
   const displayName = r.str();
   const saveSlotIndex = r.i32();
@@ -577,17 +653,32 @@ export function parseSave(raw: Uint8Array): SaveFile {
   const summaryCurrencies = readCurrencies(r);
   const summaryEnd = r.pos;
 
-  // Player: locate via the second SRCRNCY occurrence (first is inside the summary).
-  const secondCurrency = findAnchor(raw, 'SRCRNCY', summaryCurrencies.length + 1);
-  if (secondCurrency < 0) throw new SaveParseError('could not locate player data', 0);
-  // player header (7 bytes: "" + version + 00 30) + health/energy/radiation + list count
-  const playerStart = secondCurrency - 16 - 7;
-  const pr = new BinaryReader(raw, playerStart);
-  const player = readPlayer(pr);
-  const playerRegion = { start: playerStart, end: pr.pos };
+  // Player: the first SRCRNCY list after the summary belongs to the player
+  // object, whose header is exactly 23 bytes earlier (anonymous header +
+  // health/energy/radiation + currency count). Verify by parsing; if the
+  // candidate does not decode as a player, keep scanning further SRCRNCY
+  // occurrences (defensive against extra currency lists between the two).
+  let player: PlayerData | null = null;
+  let playerRegion = { start: 0, end: 0 };
+  for (let occurrence = 1; ; occurrence++) {
+    const at = findAnchor(raw, 'SRCRNCY', occurrence, summaryEnd);
+    if (at < 0) throw new SaveParseError('could not locate player data', 0);
+    const start = at - 23;
+    if (start <= summaryEnd) continue;
+    try {
+      const pr = new BinaryReader(raw, start);
+      const candidate = readPlayer(pr);
+      player = candidate;
+      playerRegion = { start, end: pr.pos };
+      break;
+    } catch {
+      // Not a player header; try the next occurrence.
+    }
+  }
+  if (!player) throw new SaveParseError('could not locate player data', 0);
 
   // Ranch
-  const ranchStart = findAnchor(raw, 'SRRANCH', 1);
+  const ranchStart = findAnchor(raw, 'SRRANCH', 1, playerRegion.end);
   if (ranchStart < 0 || ranchStart < playerRegion.end) throw new SaveParseError('could not locate ranch data', 0);
   const rr = new BinaryReader(raw, ranchStart);
   const ranch = readObjStart(rr, 'SRRANCH');
@@ -606,14 +697,33 @@ export function parseSave(raw: Uint8Array): SaveFile {
     actorParseError = e instanceof Error ? e.message : String(e);
   }
 
-  // Component index lives near the end of the file; locate by anchor.
+  // Upgrade component index (and, in GameV11+ saves, the scene group index)
+  // live near the end of the header data; locate by anchor.
   let componentIndex: string[] = [];
-  const uci = findAnchor(raw, 'SRUCI', 1);
-  if (uci >= 0) {
-    try {
-      componentIndex = readIndexTable(new BinaryReader(raw, uci), 'SRUCI');
-    } catch {
-      componentIndex = [];
+  let sceneGroupIndex: string[] = [];
+  if (game.version >= INDX_LOOKUP_MIN_GAME_VERSION) {
+    // A second INDXTBLLKUP after the game settings carries these tables.
+    for (let occurrence = 1; occurrence <= 8; occurrence++) {
+      const at = findAnchor(raw, 'INDXTBLLKUP', occurrence, summaryEnd);
+      if (at < 0 || at >= playerRegion.end) break;
+      try {
+        const tables = readIndxLookup(new BinaryReader(raw, at));
+        if (tables.has('IdentifiableType')) continue; // a stray header copy
+        if (!componentIndex.length) componentIndex = lookupTable(tables, 'UpgradeComponent');
+        if (!sceneGroupIndex.length) sceneGroupIndex = lookupTable(tables, 'SceneGroup');
+      } catch {
+        // Not a readable lookup; keep whatever we have.
+      }
+      if (componentIndex.length || sceneGroupIndex.length) break;
+    }
+  } else {
+    const uci = findAnchor(raw, 'SRUCI', 1);
+    if (uci >= 0) {
+      try {
+        componentIndex = readIndexTable(new BinaryReader(raw, uci), 'SRUCI');
+      } catch {
+        componentIndex = [];
+      }
     }
   }
 
@@ -625,6 +735,7 @@ export function parseSave(raw: Uint8Array): SaveFile {
     iconIndex,
     zoneIndex,
     componentIndex,
+    sceneGroupIndex,
     gameName,
     saveSlotIndex,
     displayName,

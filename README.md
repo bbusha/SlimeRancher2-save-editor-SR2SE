@@ -55,7 +55,7 @@ The AppImage runs with `--no-sandbox` on SteamOS automatically (the read-only ro
 
 ## Supported saves
 
-Save format versions 9 and 10 (game 1.1.x – 1.2.x). Older early-access saves are rejected with a clear message instead of being modified.
+Save format versions 9, 10 and 11 (game 1.1.x – 1.3.x). Older early-access saves are rejected with a clear message instead of being modified. Version 11 (game 1.3.0+) moved the index tables into an `INDXTBLLKUP` object and uses `PlayerV12`; the rest of the layout is unchanged, so editing a v9/v10 save still produces the same bytes it did before.
 
 ## Development
 
@@ -74,7 +74,7 @@ CI (`.github/workflows/build.yml`) builds both platforms on every push and attac
 
 ### How the format was decoded
 
-The binary layout follows the game's `PersistedDataSet` classes (`GameV10`, `PlayerV11`, `RanchV03`, `LandPlotV02`, `AmmoDataV02`, `ActorDataV04`, …). Objects are framed as `<name><i32 version> 00 30 … 00 40`, dictionaries write `00 20` after every pair, nullable values carry a leading bool. The editor parses only the regions it edits (index tables, summary currencies, the player block up to the refinery counts, and the ranch plot list) and copies every other byte untouched, then re-parses its own output before writing to disk.
+The binary layout follows the game's `PersistedDataSet` classes (`GameV9`–`GameV11`, `PlayerV9`–`PlayerV12`, `RanchV02`–`V03`, `LandPlotV02`, `AmmoDataV01`–`V02`, `ActorDataV02`–`V04`, …). Objects are framed as `<name><i32 version> 00 30 … 00 40`, dictionaries write `00 20` after every pair, nullable values carry a leading bool. From GameV11 the four index tables live inside an `INDXTBLLKUP` object (key → `INDXTBL` object), and a second `INDXTBLLKUP` later in the file carries the scene-group and upgrade-component tables. The editor parses only the regions it edits (index tables, summary currencies, the player block up to the refinery counts, and the ranch plot list) and copies every other byte untouched, then re-parses its own output before writing to disk.
 
 ## License
 
