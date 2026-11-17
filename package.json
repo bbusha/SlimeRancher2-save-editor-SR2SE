@@ -1,7 +1,7 @@
 {
   "name": "sr2-save-editor",
   "productName": "Slime Rancher 2 Save Editor",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Desktop save editor for Slime Rancher 2 with an interactive ranch map (Windows / SteamOS)",
   "main": "./out/main/index.js",
   "author": "Microb4ek",
